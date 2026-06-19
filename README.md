@@ -1,11 +1,6 @@
-# TEAM NUMBER: MSRIT_ByteX
+# Stock Pulse — Autonomous Stock Intelligence Assistant
 
-## Stock Pulse - An Autonomous Stock Intelligence Assistant With Telegram Integration.
-
-> A conversational AI agent built on the OpenClaw framework that delivers real-time Indian stock analysis, price alerts, and portfolio tracking — directly in Telegram.
-
-**Hackathon:** Samsung PRISM × OpenClaw — "Clash of the Claws" 2026  
-**Theme:** Theme 3 — Productivity (Delegate tasks to the intelligent orchestrator)
+> A conversational AI agent that delivers real-time Indian stock analysis, price alerts, and portfolio tracking — directly in Telegram.
 
 ---
 
@@ -13,12 +8,12 @@
 
 | Command | Description |
 |---|---|
-| `/analyze RELIANCE` | Technical analysis (MA20, MA50, RSI) + AI/Rule Based insight |
-| `/buyalert TCS 3500` | Get notified when TCS goes below ₹3500 |
-| `/sellalert TCS 3500` | Get notified when TCS goes above ₹3500 |
+| `/analyze RELIANCE` | Technical analysis (MA20, MA50, RSI) + AI/Rule-based insight |
+| `/buyalert TCS 3500` | Get notified when TCS drops below ₹3500 |
+| `/sellalert TCS 3500` | Get notified when TCS rises above ₹3500 |
 | `/updatealert <alert_no> 3500` | Update the target price of an existing alert while retaining its original trigger condition |
 | `/cancelalert <alert_no>` | Remove an active stock alert |
-| `/alerts` | Get a list of all the active alerts set by you |
+| `/alerts` | View all your active alerts |
 | `/buy TCS 10 3500` | Add a stock purchase entry to your portfolio |
 | `/sell TCS 5` | Partial or full sell |
 | `/portfolio` | View holdings with total invested value |
@@ -35,7 +30,6 @@ The bot runs 24/7 with a background heartbeat that monitors price alerts every 2
          ▼
 ┌─────────────────────┐
 │  Node.js Bot        │  bot.js — Telegram polling, SQLite alerts & portfolio
-│  (OpenClaw Channel) │
 └────────┬────────────┘
          │ HTTP (axios)
          ▼
@@ -46,16 +40,13 @@ The bot runs 24/7 with a background heartbeat that monitors price alerts every 2
          │
          ▼
 ┌─────────────────────┐
-│  Claude Haiku       │  AI-powered plain-English explanations
-│  (claude-haiku-4-5) │
-|                     |
-|   Local Ollma       |
-|                     |
-|   Rule Based        |
+│  AI Explanation     │  Claude Haiku (primary)
+│  Layer              │  Local Ollama (optional)
+│                     │  Rule-based fallback
 └─────────────────────┘
 ```
 
-**OpenClaw files:**
+**Agent configuration files:**
 - `SOUL.md` — Agent personality & behavioral boundaries
 - `HEARTBEAT.md` — Background daemon task configuration
 - `Skill.md` — Skill definitions for each capability
@@ -69,12 +60,13 @@ The bot runs 24/7 with a background heartbeat that monitors price alerts every 2
 - Python ≥ 3.11 — [python.org](https://python.org)
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 - (Optional) An Anthropic API key for AI explanations — [console.anthropic.com](https://console.anthropic.com)
+- (Optional) An Alpha Vantage API key — [alphavantage.co](https://www.alphavantage.co)
 
 ### 1. Clone the repo
 
 ```powershell
-git clone https://github.com/maurya-doshi/Samsung-PRISM-Hackathon.git
-cd Samsung-PRISM-Hackathon
+git clone https://github.com/maurya-doshi/Autonomous-Stock-Intelligence-Assistant.git
+cd Autonomous-Stock-Intelligence-Assistant
 ```
 
 ### 2. Set up the Python API
@@ -101,7 +93,7 @@ cd ..
 Create `backend/.env`:
 
 ```env
-TOKEN=your_telegram_bot_api_here
+TOKEN=your_telegram_bot_token_here
 ANTHROPIC_API_KEY=your_anthropic_api_key_here
 ALPHA_VANTAGE_API_KEY=your_alpha_vantage_api_key_here
 ```
@@ -120,7 +112,7 @@ venv\Scripts\activate
 uvicorn api.main:app --reload --port 8000
 ```
 
-Verify it's running: open http://localhost:8000/health in your browser.
+Verify it's running: open [http://localhost:8000/health](http://localhost:8000/health) in your browser.
 
 ### Terminal 2 — Telegram bot
 
@@ -138,7 +130,7 @@ Open Telegram, find your bot, and send `/start`.
 ```
 /analyze RELIANCE
 /analyze TCS.NS
-/alert INFY 1800
+/buyalert INFY 1800
 /alerts
 /cancelalert 1
 /buy WIPRO 20 450
@@ -151,46 +143,40 @@ Open Telegram, find your bot, and send `/start`.
 ## Project Structure
 
 ```
-    Samsung-PRISM-Hackathon/
-    ├── api
-    │   ├── analysis.py
-    │   ├── explain.py
-    │   ├── __init__.py
-    │   └── main.py
-    ├── backend
-    │   ├── bot.js
-    │   ├── package.json
-    │   └── package-lock.json
-    ├── HEARTBEAT.md
-    ├── LICENSE
-    ├── package-lock.json
-    ├── README.md
-    ├── requirements.txt
-    ├── Skill.md
-    └── SOUL.md
-
-    3 directories, 14 files
+Autonomous-Stock-Intelligence-Assistant/
+├── api/
+│   ├── analysis.py       # Technical indicators (MA, RSI, signal)
+│   ├── explain.py        # LLM + rule-based explanation engine
+│   ├── main.py           # FastAPI routes
+│   └── __init__.py
+├── backend/
+│   ├── bot.js            # Telegram bot, alert daemon, portfolio logic
+│   ├── package.json
+│   └── package-lock.json
+├── HEARTBEAT.md          # Background daemon documentation
+├── LICENSE
+├── README.md
+├── requirements.txt
+├── Skill.md              # Agent skill definitions
+└── SOUL.md               # Agent personality & boundaries
 ```
 
 ---
 
-## Documentation
+## Tech Stack
 
-A directory that contains the complete documentation in the format requested by the organizers.
-
-    1. Project Video Demo.
-    2. PPT
-    3. Photos of the output/conversation with the bot using the telegram interface.
-    4. Database and debug logs.
+| Layer | Technology |
+|---|---|
+| Telegram interface | Node.js + `node-telegram-bot-api` |
+| Backend API | Python + FastAPI |
+| Stock data | yfinance, Alpha Vantage |
+| Technical analysis | pandas, numpy (MA, RSI) |
+| AI explanations | Anthropic Claude Haiku / Local Ollama |
+| Storage | SQLite (per-user, isolated) |
+| Background tasks | `node-cron` (every 2 minutes) |
 
 ---
 
-## AI Disclosure
+## License
 
-The following AI models were used during the course of the development of this software:
-1. Claude Sonnet 4.6
-2. Claude Haiku 4.5
-
-They were used for the following purposes:
-1. Code generation.
-2. Information retrieval.
+See [LICENSE](./LICENSE) for details.
