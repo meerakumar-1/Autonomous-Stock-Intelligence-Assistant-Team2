@@ -6,6 +6,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 const sqlite3 = require('sqlite3').verbose();
 const cron = require('node-cron');
+const { createClient } = require('redis');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const TOKEN = process.env.TOKEN;
@@ -26,17 +27,12 @@ const db = new sqlite3.Database('./database.db', (err) => {
   console.log('Connected to SQLite database.');
 });
 
-db.run(`
-  CREATE TABLE IF NOT EXISTS alerts (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id   INTEGER NOT NULL,
-    ticker    TEXT    NOT NULL COLLATE NOCASE,
-    target    REAL    NOT NULL,
-    direction TEXT    NOT NULL,
-    triggered INTEGER DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
-`);
+const redisClient = createClient({
+  url: process.env.REDIS_URL || 'redis://localhost:6379'
+});
+redisClient.on('error', err => console.error('Redis Client Error', err));
+redisClient.connect().then(() => console.log('Connected to Redis database.'));
+
 
 db.run(`
   CREATE TABLE IF NOT EXISTS portfolio (
@@ -280,17 +276,27 @@ bot.onText(/\/sellalert(?:\s+(.*))?/i, async (msg, match) => {
     });
   }
 
-  db.run(
-    `INSERT INTO alerts (chat_id, ticker, target, direction) VALUES (?, ?, ?, 'above')`,
-    [chatId, ticker, target],
-    function (err) {
-      if (err) return bot.editMessageText('❌ Failed to save alert.', { chat_id: chatId, message_id: waiting.message_id });
-      bot.editMessageText(
-        `✅ Sell Alert set!\n📌 *${ticker}* @ ₹${target}\nID: \`${this.lastID}\`\n\nYou'll be notified when the price goes above this level.`,
-        { chat_id: chatId, message_id: waiting.message_id, parse_mode: 'Markdown' }
-      );
-    }
-  );
+  try {
+    const alertId = await redisClient.incr('alert_id_seq');
+    await redisClient.hSet(`alert:${alertId}`, {
+      id: alertId.toString(),
+      chat_id: chatId.toString(),
+      ticker: ticker,
+      target: target.toString(),
+      direction: 'above',
+      triggered: '0',
+      created_at: new Date().toISOString()
+    });
+    await redisClient.sAdd(`user_alerts:${chatId}`, alertId.toString());
+    await redisClient.sAdd(`active_alerts`, alertId.toString());
+
+    bot.editMessageText(
+      `✅ Sell Alert set!\n📌 *${ticker}* @ ₹${target}\nID: \`${alertId}\`\n\nYou'll be notified when the price goes above this level.`,
+      { chat_id: chatId, message_id: waiting.message_id, parse_mode: 'Markdown' }
+    );
+  } catch (err) {
+    bot.editMessageText('❌ Failed to save alert.', { chat_id: chatId, message_id: waiting.message_id });
+  }
 });
 
 // /buyalert <ticker> <price>
@@ -323,60 +329,81 @@ bot.onText(/\/buyalert(?:\s+(.*))?/i, async (msg, match) => {
     });
   }
 
-  db.run(
-    `INSERT INTO alerts (chat_id, ticker, target, direction) VALUES (?, ?, ?, 'below')`,
-    [chatId, ticker, target],
-    function (err) {
-      if (err) return bot.editMessageText('❌ Failed to save alert.', { chat_id: chatId, message_id: waiting.message_id });
-      bot.editMessageText(
-        `✅ Buy Alert set!\n📌 *${ticker}* @ ₹${target}\nID: \`${this.lastID}\`\n\nYou'll be notified when the price dips below this level.`,
-        { chat_id: chatId, message_id: waiting.message_id, parse_mode: 'Markdown' }
-      );
-    }
-  );
+  try {
+    const alertId = await redisClient.incr('alert_id_seq');
+    await redisClient.hSet(`alert:${alertId}`, {
+      id: alertId.toString(),
+      chat_id: chatId.toString(),
+      ticker: ticker,
+      target: target.toString(),
+      direction: 'below',
+      triggered: '0',
+      created_at: new Date().toISOString()
+    });
+    await redisClient.sAdd(`user_alerts:${chatId}`, alertId.toString());
+    await redisClient.sAdd(`active_alerts`, alertId.toString());
+
+    bot.editMessageText(
+      `✅ Buy Alert set!\n📌 *${ticker}* @ ₹${target}\nID: \`${alertId}\`\n\nYou'll be notified when the price dips below this level.`,
+      { chat_id: chatId, message_id: waiting.message_id, parse_mode: 'Markdown' }
+    );
+  } catch (err) {
+    bot.editMessageText('❌ Failed to save alert.', { chat_id: chatId, message_id: waiting.message_id });
+  }
 });
 
 
 // /alerts – list active alerts for this user
-bot.onText(/\/alerts$/, (msg) => {
+bot.onText(/\/alerts$/, async (msg) => {
   const chatId = msg.chat.id;
 
-  db.all(
-    `SELECT * FROM alerts WHERE chat_id = ? AND triggered = 0 ORDER BY id`,
-    [chatId],
-    (err, rows) => {
-      if (err) {
-        console.error('/alerts DB error:', err.message);
-        return bot.sendMessage(chatId, '❌ Could not retrieve alerts. Please try again.');
-      }
-      if (!rows.length) {
-        return bot.sendMessage(chatId, 'ℹ️ You have no active alerts.\n\nUse /sellalert or /buyalert <ticker> <price> to set one.');
-      }
-      const lines = rows.map(
-        (r) => `• #${r.id}  *${r.ticker}*  @ ₹${r.target}`
-      );
-      bot.sendMessage(chatId, `🔔 *Your Active Alerts*\n━━━━━━━━━━━━━━━━━━\n${lines.join('\n')}`, {
-        parse_mode: 'Markdown',
-      });
+  try {
+    const alertIds = await redisClient.sMembers(`user_alerts:${chatId}`);
+    if (!alertIds.length) {
+      return bot.sendMessage(chatId, 'ℹ️ You have no active alerts.\n\nUse /sellalert or /buyalert <ticker> <price> to set one.');
     }
-  );
+    
+    const alerts = [];
+    for (const id of alertIds) {
+      const data = await redisClient.hGetAll(`alert:${id}`);
+      if (data && data.triggered === '0') {
+         alerts.push(data);
+      }
+    }
+    
+    alerts.sort((a, b) => parseInt(a.id) - parseInt(b.id));
+
+    if (!alerts.length) {
+       return bot.sendMessage(chatId, 'ℹ️ You have no active alerts.\n\nUse /sellalert or /buyalert <ticker> <price> to set one.');
+    }
+
+    const lines = alerts.map((r) => `• #${r.id}  *${r.ticker}*  @ ₹${r.target}`);
+    bot.sendMessage(chatId, `🔔 *Your Active Alerts*\n━━━━━━━━━━━━━━━━━━\n${lines.join('\n')}`, {
+      parse_mode: 'Markdown',
+    });
+  } catch (err) {
+    console.error('/alerts Redis error:', err.message);
+    bot.sendMessage(chatId, '❌ Could not retrieve alerts. Please try again.');
+  }
 });
 
 // /cancelalert <id>
-bot.onText(/\/cancelalert\s+(\d+)/i, (msg, match) => {
+bot.onText(/\/cancelalert\s+(\d+)/i, async (msg, match) => {
   const chatId = msg.chat.id;
   const id = parseInt(match[1]);
 
-  db.run(
-    `DELETE FROM alerts WHERE id = ? AND chat_id = ?`,
-    [id, chatId],
-    function (err) {
-      if (err || this.changes === 0) {
-        return bot.sendMessage(chatId, `❌ Alert #${id} not found.`);
-      }
-      bot.sendMessage(chatId, `🗑️ Alert #${id} cancelled.`);
+  try {
+    const data = await redisClient.hGetAll(`alert:${id}`);
+    if (!data || data.chat_id !== chatId.toString()) {
+      return bot.sendMessage(chatId, `❌ Alert #${id} not found.`);
     }
-  );
+    await redisClient.sRem(`user_alerts:${chatId}`, id.toString());
+    await redisClient.sRem(`active_alerts`, id.toString());
+    await redisClient.del(`alert:${id}`);
+    bot.sendMessage(chatId, `🗑️ Alert #${id} cancelled.`);
+  } catch (err) {
+    bot.sendMessage(chatId, `❌ Failed to cancel alert.`);
+  }
 });
 
 // /updatealert <id> <new_price>
@@ -395,25 +422,36 @@ bot.onText(/\/updatealert(?:\s+(.*))?/i, async (msg, match) => {
     return bot.sendMessage(chatId, '❌ Invalid ID or price. Usage: `/updatealert 3 3600`', { parse_mode: 'Markdown' });
   }
 
-  // Update in DB
-  db.run(
-    `UPDATE alerts SET target = ? WHERE id = ? AND chat_id = ?`,
-    [newTarget, id, chatId],
-    function (err) {
-      if (err || this.changes === 0) {
-        return bot.sendMessage(chatId, `❌ Alert #${id} not found or could not be updated.`);
-      }
-      bot.sendMessage(chatId, `✅ Alert #${id} updated to new target: ₹${newTarget}`);
+  // Update in Redis
+  try {
+    const data = await redisClient.hGetAll(`alert:${id}`);
+    if (!data || data.chat_id !== chatId.toString()) {
+      return bot.sendMessage(chatId, `❌ Alert #${id} not found or could not be updated.`);
     }
-  );
+    await redisClient.hSet(`alert:${id}`, 'target', newTarget.toString());
+    bot.sendMessage(chatId, `✅ Alert #${id} updated to new target: ₹${newTarget}`);
+  } catch (err) {
+    bot.sendMessage(chatId, `❌ Alert #${id} not found or could not be updated.`);
+  }
 });
 
 // ── Alert Scheduler (every 2 minutes) ─────────────────────────────────────────
 cron.schedule('*/2 * * * *', async () => {
   console.log('[cron] Checking alerts…');
 
-  db.all(`SELECT * FROM alerts WHERE triggered = 0`, [], async (err, alerts) => {
-    if (err || !alerts.length) return;
+  try {
+    const activeIds = await redisClient.sMembers('active_alerts');
+    if (!activeIds.length) return;
+
+    const alerts = [];
+    for (const id of activeIds) {
+      const data = await redisClient.hGetAll(`alert:${id}`);
+      if (data && data.id) {
+        data.target = parseFloat(data.target);
+        data.chat_id = parseInt(data.chat_id);
+        alerts.push(data);
+      }
+    }
 
     // Group by ticker to minimise API calls
     const byTicker = alerts.reduce((acc, a) => {
@@ -440,11 +478,13 @@ cron.schedule('*/2 * * * *', async () => {
         if (alert.direction === 'any') {
           // Lock in direction based on current vs target
           const dir = currentPrice >= alert.target ? 'above' : 'below';
-          db.run(`UPDATE alerts SET direction = ? WHERE id = ?`, [dir, alert.id]);
+          await redisClient.hSet(`alert:${alert.id}`, 'direction', dir);
           continue; // evaluate on next tick
         }
 
         if (hit) {
+          await redisClient.hSet(`alert:${alert.id}`, 'triggered', '1');
+          await redisClient.sRem('active_alerts', alert.id.toString());
           bot.sendMessage(
             alert.chat_id,
             `🚨 *Price Alert Triggered!*\n\n` +
@@ -455,7 +495,9 @@ cron.schedule('*/2 * * * *', async () => {
         }
       }
     }
-  });
+  } catch (err) {
+    console.error('[cron] Redis error:', err);
+  }
 });
 
 // ── Portfolio Commands ────────────────────────────────────────────────────────
