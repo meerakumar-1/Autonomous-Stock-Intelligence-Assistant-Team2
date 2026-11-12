@@ -1,0 +1,47 @@
+name: Backend Static Checks
+
+on:
+  push:
+    branches:
+      - team2/portfolio-redis-cache
+
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  node-check:
+    name: Node.js Backend Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check JavaScript syntax
+        run: node --check backend/bot.js
+
+      - name: Run backend test script
+        working-directory: backend
+        run: npm test
+
+  python-check:
+    name: Python API Syntax Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check Python syntax
+        run: python -m compileall -q api
