@@ -1,10 +1,9 @@
+
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
-
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
-const sqlite3 = require('sqlite3').verbose();
 const cron = require('node-cron');
 const { createClient } = require('redis');
 
@@ -20,40 +19,60 @@ if (!TOKEN) {
 
 const bot = new TelegramBot(TOKEN, { polling: true });
 
-
-// ── Database Setup ────────────────────────────────────────────────────────────
-const db = new sqlite3.Database('./database.db', (err) => {
-  if (err) return console.error('DB error:', err.message);
-  console.log('Connected to SQLite database.');
-});
-
+// ── Redis Connection ──────────────────────────────────────────────────────────
 const redisClient = createClient({
   url: process.env.REDIS_URL || 'redis://localhost:6379'
 });
+
 redisClient.on('error', err => console.error('Redis Client Error', err));
-redisClient.connect().then(() => console.log('Connected to Redis database.'));
 
-
-db.run(`
-  CREATE TABLE IF NOT EXISTS portfolio (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id    INTEGER NOT NULL,
-    ticker     TEXT    NOT NULL COLLATE NOCASE,
-    quantity   REAL    NOT NULL,
-    buy_price  REAL    NOT NULL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
-`);
+redisClient.connect()
+  .then(() => console.log('Connected to Redis database.'))
+  .catch(err => {
+    console.error('❌ Could not connect to Redis:', err.message);
+    process.exit(1);
+  });
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/** Fetch analysis from Python FastAPI service */
+/**
+ * Fetch stock analysis using Redis caching.
+ * Cache key: cache:analysis:{ticker}
+ * TTL: 60 seconds
+ */
 async function fetchAnalysis(ticker) {
-  const res = await axios.get(`${PYTHON_API}/analysis`, {
-    params: { ticker },
+  const normalizedTicker = ticker.trim().toUpperCase();
+  const cacheKey = `cache:analysis:${normalizedTicker}`;
+
+  // Step 1: Check Redis cache
+  const cachedData = await redisClient.get(cacheKey);
+
+  if (cachedData !== null) {
+    try {
+      console.log(`[cache] HIT ${normalizedTicker}`);
+      return JSON.parse(cachedData);
+    } catch (error) {
+      console.warn(`[cache] Invalid entry for ${normalizedTicker}; refreshing.`);
+      await redisClient.del(cacheKey);
+    }
+  }
+
+  // Step 2: Cache miss - call Python FastAPI
+  console.log(`[cache] MISS ${normalizedTicker}`);
+
+  const response = await axios.get(`${PYTHON_API}/analysis`, {
+    params: { ticker: normalizedTicker },
     timeout: 15000,
   });
-  return res.data; // { ticker, price, ma20, ma50, rsi, signal }
+
+  // Step 3: Store response for 60 seconds
+  await redisClient.setEx(
+    cacheKey,
+    60,
+    JSON.stringify(response.data)
+  );
+
+  return response.data;
 }
 
 /** Fetch LLM explanation from Python/Ollama service */
@@ -61,13 +80,14 @@ async function fetchExplanation(analysisData) {
   const res = await axios.post(`${PYTHON_API}/explain`, analysisData, {
     timeout: 60000,
   });
+
   return res.data.explanation;
 }
 
 /** Format analysis result into a readable message */
 function formatAnalysis(data, explanation) {
   const signal = {
-    buy:  '🟢 BUY',
+    buy: '🟢 BUY',
     sell: '🔴 SELL',
     hold: '🟡 HOLD',
   }[data.signal?.toLowerCase()] ?? '⚪ UNKNOWN';
@@ -129,155 +149,226 @@ bot.onText(/\/help/, (msg) => {
   );
 });
 
-// Check python service status
+// /status
 bot.onText(/\/status/, async (msg) => {
-    const chatId = msg.chat.id;
-    try {
-        const response = await axios.get(`${PYTHON_API}/`);
-        bot.sendMessage(chatId, `🐍 Python Service Status: ${response.data.status} at ${response.data.time}`);
-    } catch (error) {
-        bot.sendMessage(chatId, `❌ Error connecting to Python Service: ${error.message}`);
-    }
+  const chatId = msg.chat.id;
+
+  try {
+    const response = await axios.get(`${PYTHON_API}/`);
+
+    bot.sendMessage(
+      chatId,
+      `🐍 Python Service Status: ${response.data.status} at ${response.data.time}`
+    );
+  } catch (error) {
+    bot.sendMessage(
+      chatId,
+      `❌ Error connecting to Python Service: ${error.message}`
+    );
+  }
 });
 
-// Get info for a ticker
+// /info
 bot.onText(/\/info (.+)/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const ticker = match[1].toUpperCase();
-    
-    try {
-        const response = await axios.get(`${PYTHON_API}/info`, { params: { ticker } });
-        const data = response.data;
-        bot.sendMessage(chatId, `📈 **${data.ticker} Info**\nUnits: ${data.units}\nCap: $${data.cap}\nCurrent Value: $${data.current_value}`, { parse_mode: 'Markdown' });
-    } catch (error) {
-        if (error.response && error.response.status === 400) {
-            bot.sendMessage(chatId, `⚠️ ${error.response.data.detail}`);
-        } else {
-            bot.sendMessage(chatId, `❌ Error fetching info: ${error.message}`);
-        }
+  const chatId = msg.chat.id;
+  const ticker = match[1].toUpperCase();
+
+  try {
+    const response = await axios.get(`${PYTHON_API}/info`, {
+      params: { ticker }
+    });
+
+    const data = response.data;
+
+    bot.sendMessage(
+      chatId,
+      `📈 **${data.ticker} Info**\nUnits: ${data.units}\nCap: $${data.cap}\nCurrent Value: $${data.current_value}`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (error) {
+    if (error.response && error.response.status === 400) {
+      bot.sendMessage(chatId, `⚠️ ${error.response.data.detail}`);
+    } else {
+      bot.sendMessage(chatId, `❌ Error fetching info: ${error.message}`);
     }
+  }
 });
 
-// Echo any message (for testing)
+// Echo messages for testing
 bot.on('message', (msg) => {
-    const chatId = msg.chat.id;
-    const text = msg.text;
+  const chatId = msg.chat.id;
+  const text = msg.text;
 
-    // Ignore commands
-    if (text.startsWith('/')) return;
+  if (!text || text.startsWith('/')) return;
 
-    console.log("Received:", text);
-    bot.sendMessage(chatId, `You said: ${text}`);
+  console.log("Received:", text);
+  bot.sendMessage(chatId, `You said: ${text}`);
 });
 
-// /analyze <ticker>
+// /analyze
 bot.onText(/\/analyze(?:\s+(.*))?/i, async (msg, match) => {
   const chatId = msg.chat.id;
   const ticker = match[1]?.trim()?.toUpperCase();
 
   if (!ticker) {
-    return bot.sendMessage(chatId, '❓ Usage: `/analyze RELIANCE`', { parse_mode: 'Markdown' });
+    return bot.sendMessage(
+      chatId,
+      '❓ Usage: `/analyze RELIANCE`',
+      { parse_mode: 'Markdown' }
+    );
   }
 
-  const waiting = await bot.sendMessage(chatId, `🔍 Fetching analysis for *${ticker}*…`, {
-    parse_mode: 'Markdown',
-  });
+  const waiting = await bot.sendMessage(
+    chatId,
+    `🔍 Fetching analysis for *${ticker}*…`,
+    { parse_mode: 'Markdown' }
+  );
 
   try {
     const data = await fetchAnalysis(ticker);
 
-    // Try to get LLM explanation (non-blocking – won't fail if unavailable)
     let explanation = null;
+
     try {
       explanation = await fetchExplanation(data);
     } catch {
       explanation = '_AI explanation service unavailable._';
     }
 
-    await bot.editMessageText(formatAnalysis(data, explanation), {
-      chat_id: chatId,
-      message_id: waiting.message_id,
-      parse_mode: 'Markdown',
-    });
+    await bot.editMessageText(
+      formatAnalysis(data, explanation),
+      {
+        chat_id: chatId,
+        message_id: waiting.message_id,
+        parse_mode: 'Markdown',
+      }
+    );
   } catch (err) {
     console.error('/analyze error:', err.message);
+
     const detail = err.response?.data?.detail ?? err.message;
+
     bot.editMessageText(
       `❌ Error for *${ticker}*: ${detail}\n\nMake sure the ticker is correct (e.g., RELIANCE or WIPRO).`,
-      { chat_id: chatId, message_id: waiting.message_id, parse_mode: 'Markdown' }
+      {
+        chat_id: chatId,
+        message_id: waiting.message_id,
+        parse_mode: 'Markdown'
+      }
     );
   }
 });
 
-
-// /ipo – list recent IPO debut stocks with live prices
+// /ipo
 bot.onText(/\/ipo$/, async (msg) => {
   const chatId = msg.chat.id;
 
-  const loading = await bot.sendMessage(chatId, '🔍 Fetching recent IPO listings…');
+  const loading = await bot.sendMessage(
+    chatId,
+    '🔍 Fetching recent IPO listings…'
+  );
 
   try {
-    const res = await axios.get(`${PYTHON_API}/ipos`, { params: { limit: 8 }, timeout: 30000 });
+    const res = await axios.get(`${PYTHON_API}/ipos`, {
+      params: { limit: 8 },
+      timeout: 30000
+    });
+
     const ipos = res.data.ipos;
 
     if (!ipos || ipos.length === 0) {
-      return bot.editMessageText('ℹ️ No IPO data available right now.', {
-        chat_id: chatId, message_id: loading.message_id,
-      });
+      return bot.editMessageText(
+        'ℹ️ No IPO data available right now.',
+        {
+          chat_id: chatId,
+          message_id: loading.message_id
+        }
+      );
     }
 
     const lines = ipos.map((ipo) => {
-      const price  = ipo.current_price != null ? `₹${ipo.current_price}` : 'N/A';
+      const price = ipo.current_price != null
+        ? `₹${ipo.current_price}`
+        : 'N/A';
+
       const change = ipo.change_pct != null
-        ? (ipo.change_pct >= 0 ? `📈 +${ipo.change_pct}%` : `📉 ${ipo.change_pct}%`)
+        ? (ipo.change_pct >= 0
+          ? `📈 +${ipo.change_pct}%`
+          : `📉 ${ipo.change_pct}%`)
         : '';
+
       return `• *${ipo.name}* (${ipo.ticker.replace('.NS', '')})\n  Listed: ${ipo.ipo_date}  |  ${price}  ${change}`;
     });
 
     await bot.editMessageText(
       `🚀 *Recent IPO Listings*\n━━━━━━━━━━━━━━━━━━\n${lines.join('\n\n')}`,
-      { chat_id: chatId, message_id: loading.message_id, parse_mode: 'Markdown' }
+      {
+        chat_id: chatId,
+        message_id: loading.message_id,
+        parse_mode: 'Markdown'
+      }
     );
   } catch (err) {
     console.error('/ipo error:', err.message);
-    bot.editMessageText('❌ Could not fetch IPO data. Is the Python service running?', {
-      chat_id: chatId, message_id: loading.message_id,
-    });
+
+    bot.editMessageText(
+      '❌ Could not fetch IPO data. Is the Python service running?',
+      {
+        chat_id: chatId,
+        message_id: loading.message_id
+      }
+    );
   }
 });
 
-// /sellalert <ticker> <price>
+// /sellalert
 bot.onText(/\/sellalert(?:\s+(.*))?/i, async (msg, match) => {
   const chatId = msg.chat.id;
   const args = match[1]?.trim().split(/\s+/);
 
   if (!args || args.length < 2) {
-    return bot.sendMessage(chatId, '❓ Usage: `/sellalert TCS 3500`', { parse_mode: 'Markdown' });
+    return bot.sendMessage(
+      chatId,
+      '❓ Usage: `/sellalert TCS 3500`',
+      { parse_mode: 'Markdown' }
+    );
   }
 
   const ticker = args[0].toUpperCase();
   const target = parseFloat(args[1]);
 
   if (isNaN(target) || target <= 0) {
-    return bot.sendMessage(chatId, '❌ Invalid price. Usage: `/sellalert TCS 3500`', { parse_mode: 'Markdown' });
+    return bot.sendMessage(
+      chatId,
+      '❌ Invalid price. Usage: `/sellalert TCS 3500`',
+      { parse_mode: 'Markdown' }
+    );
   }
 
-  const waiting = await bot.sendMessage(chatId, `⏳ Verifying *${ticker}*…`, { parse_mode: 'Markdown' });
+  const waiting = await bot.sendMessage(
+    chatId,
+    `⏳ Verifying *${ticker}*…`,
+    { parse_mode: 'Markdown' }
+  );
 
-  // Validate ticker before saving
   try {
     await fetchAnalysis(ticker);
   } catch (err) {
     const detail = err.response?.data?.detail ?? 'Stock not found.';
-    return bot.editMessageText(`❌ *${ticker}*: ${detail}`, {
-      chat_id: chatId,
-      message_id: waiting.message_id,
-      parse_mode: 'Markdown',
-    });
+
+    return bot.editMessageText(
+      `❌ *${ticker}*: ${detail}`,
+      {
+        chat_id: chatId,
+        message_id: waiting.message_id,
+        parse_mode: 'Markdown'
+      }
+    );
   }
 
   try {
     const alertId = await redisClient.incr('alert_id_seq');
+
     await redisClient.hSet(`alert:${alertId}`, {
       id: alertId.toString(),
       chat_id: chatId.toString(),
@@ -287,50 +378,79 @@ bot.onText(/\/sellalert(?:\s+(.*))?/i, async (msg, match) => {
       triggered: '0',
       created_at: new Date().toISOString()
     });
+
     await redisClient.sAdd(`user_alerts:${chatId}`, alertId.toString());
-    await redisClient.sAdd(`active_alerts`, alertId.toString());
+    await redisClient.sAdd('active_alerts', alertId.toString());
 
     bot.editMessageText(
       `✅ Sell Alert set!\n📌 *${ticker}* @ ₹${target}\nID: \`${alertId}\`\n\nYou'll be notified when the price goes above this level.`,
-      { chat_id: chatId, message_id: waiting.message_id, parse_mode: 'Markdown' }
+      {
+        chat_id: chatId,
+        message_id: waiting.message_id,
+        parse_mode: 'Markdown'
+      }
     );
   } catch (err) {
-    bot.editMessageText('❌ Failed to save alert.', { chat_id: chatId, message_id: waiting.message_id });
+    console.error('/sellalert error:', err);
+
+    bot.editMessageText(
+      '❌ Failed to save alert.',
+      {
+        chat_id: chatId,
+        message_id: waiting.message_id
+      }
+    );
   }
 });
 
-// /buyalert <ticker> <price>
+// /buyalert
 bot.onText(/\/buyalert(?:\s+(.*))?/i, async (msg, match) => {
   const chatId = msg.chat.id;
   const args = match[1]?.trim().split(/\s+/);
 
   if (!args || args.length < 2) {
-    return bot.sendMessage(chatId, '❓ Usage: `/buyalert TCS 3000`', { parse_mode: 'Markdown' });
+    return bot.sendMessage(
+      chatId,
+      '❓ Usage: `/buyalert TCS 3000`',
+      { parse_mode: 'Markdown' }
+    );
   }
 
   const ticker = args[0].toUpperCase();
   const target = parseFloat(args[1]);
 
   if (isNaN(target) || target <= 0) {
-    return bot.sendMessage(chatId, '❌ Invalid price. Usage: `/buyalert TCS 3000`', { parse_mode: 'Markdown' });
+    return bot.sendMessage(
+      chatId,
+      '❌ Invalid price. Usage: `/buyalert TCS 3000`',
+      { parse_mode: 'Markdown' }
+    );
   }
 
-  const waiting = await bot.sendMessage(chatId, `⏳ Verifying *${ticker}*…`, { parse_mode: 'Markdown' });
+  const waiting = await bot.sendMessage(
+    chatId,
+    `⏳ Verifying *${ticker}*…`,
+    { parse_mode: 'Markdown' }
+  );
 
-  // Validate ticker before saving
   try {
     await fetchAnalysis(ticker);
   } catch (err) {
     const detail = err.response?.data?.detail ?? 'Stock not found.';
-    return bot.editMessageText(`❌ *${ticker}*: ${detail}`, {
-      chat_id: chatId,
-      message_id: waiting.message_id,
-      parse_mode: 'Markdown',
-    });
+
+    return bot.editMessageText(
+      `❌ *${ticker}*: ${detail}`,
+      {
+        chat_id: chatId,
+        message_id: waiting.message_id,
+        parse_mode: 'Markdown'
+      }
+    );
   }
 
   try {
     const alertId = await redisClient.incr('alert_id_seq');
+
     await redisClient.hSet(`alert:${alertId}`, {
       id: alertId.toString(),
       chat_id: chatId.toString(),
@@ -340,98 +460,154 @@ bot.onText(/\/buyalert(?:\s+(.*))?/i, async (msg, match) => {
       triggered: '0',
       created_at: new Date().toISOString()
     });
+
     await redisClient.sAdd(`user_alerts:${chatId}`, alertId.toString());
-    await redisClient.sAdd(`active_alerts`, alertId.toString());
+    await redisClient.sAdd('active_alerts', alertId.toString());
 
     bot.editMessageText(
       `✅ Buy Alert set!\n📌 *${ticker}* @ ₹${target}\nID: \`${alertId}\`\n\nYou'll be notified when the price dips below this level.`,
-      { chat_id: chatId, message_id: waiting.message_id, parse_mode: 'Markdown' }
+      {
+        chat_id: chatId,
+        message_id: waiting.message_id,
+        parse_mode: 'Markdown'
+      }
     );
   } catch (err) {
-    bot.editMessageText('❌ Failed to save alert.', { chat_id: chatId, message_id: waiting.message_id });
+    console.error('/buyalert error:', err);
+
+    bot.editMessageText(
+      '❌ Failed to save alert.',
+      {
+        chat_id: chatId,
+        message_id: waiting.message_id
+      }
+    );
   }
 });
 
-
-// /alerts – list active alerts for this user
+// /alerts
 bot.onText(/\/alerts$/, async (msg) => {
   const chatId = msg.chat.id;
 
   try {
     const alertIds = await redisClient.sMembers(`user_alerts:${chatId}`);
+
     if (!alertIds.length) {
-      return bot.sendMessage(chatId, 'ℹ️ You have no active alerts.\n\nUse /sellalert or /buyalert <ticker> <price> to set one.');
+      return bot.sendMessage(
+        chatId,
+        'ℹ️ You have no active alerts.\n\nUse /sellalert or /buyalert <ticker> <price> to set one.'
+      );
     }
-    
+
     const alerts = [];
+
     for (const id of alertIds) {
       const data = await redisClient.hGetAll(`alert:${id}`);
+
       if (data && data.triggered === '0') {
-         alerts.push(data);
+        alerts.push(data);
       }
     }
-    
+
     alerts.sort((a, b) => parseInt(a.id) - parseInt(b.id));
 
     if (!alerts.length) {
-       return bot.sendMessage(chatId, 'ℹ️ You have no active alerts.\n\nUse /sellalert or /buyalert <ticker> <price> to set one.');
+      return bot.sendMessage(
+        chatId,
+        'ℹ️ You have no active alerts.\n\nUse /sellalert or /buyalert <ticker> <price> to set one.'
+      );
     }
 
-    const lines = alerts.map((r) => `• #${r.id}  *${r.ticker}*  @ ₹${r.target}`);
-    bot.sendMessage(chatId, `🔔 *Your Active Alerts*\n━━━━━━━━━━━━━━━━━━\n${lines.join('\n')}`, {
-      parse_mode: 'Markdown',
-    });
+    const lines = alerts.map(
+      r => `• #${r.id}  *${r.ticker}*  @ ₹${r.target}`
+    );
+
+    bot.sendMessage(
+      chatId,
+      `🔔 *Your Active Alerts*\n━━━━━━━━━━━━━━━━━━\n${lines.join('\n')}`,
+      { parse_mode: 'Markdown' }
+    );
   } catch (err) {
     console.error('/alerts Redis error:', err.message);
-    bot.sendMessage(chatId, '❌ Could not retrieve alerts. Please try again.');
+
+    bot.sendMessage(
+      chatId,
+      '❌ Could not retrieve alerts. Please try again.'
+    );
   }
 });
 
-// /cancelalert <id>
+// /cancelalert
 bot.onText(/\/cancelalert\s+(\d+)/i, async (msg, match) => {
   const chatId = msg.chat.id;
   const id = parseInt(match[1]);
 
   try {
     const data = await redisClient.hGetAll(`alert:${id}`);
+
     if (!data || data.chat_id !== chatId.toString()) {
       return bot.sendMessage(chatId, `❌ Alert #${id} not found.`);
     }
+
     await redisClient.sRem(`user_alerts:${chatId}`, id.toString());
-    await redisClient.sRem(`active_alerts`, id.toString());
+    await redisClient.sRem('active_alerts', id.toString());
     await redisClient.del(`alert:${id}`);
+
     bot.sendMessage(chatId, `🗑️ Alert #${id} cancelled.`);
   } catch (err) {
-    bot.sendMessage(chatId, `❌ Failed to cancel alert.`);
+    console.error('/cancelalert error:', err);
+
+    bot.sendMessage(chatId, '❌ Failed to cancel alert.');
   }
 });
 
-// /updatealert <id> <new_price>
+// /updatealert
 bot.onText(/\/updatealert(?:\s+(.*))?/i, async (msg, match) => {
   const chatId = msg.chat.id;
   const args = match[1]?.trim().split(/\s+/);
 
   if (!args || args.length < 2) {
-    return bot.sendMessage(chatId, '❓ Usage: `/updatealert <id> <new_price>` (e.g., `/updatealert 3 3600`)', { parse_mode: 'Markdown' });
+    return bot.sendMessage(
+      chatId,
+      '❓ Usage: `/updatealert <id> <new_price>` (e.g., `/updatealert 3 3600`)',
+      { parse_mode: 'Markdown' }
+    );
   }
 
   const id = parseInt(args[0]);
   const newTarget = parseFloat(args[1]);
 
   if (isNaN(id) || isNaN(newTarget) || newTarget <= 0) {
-    return bot.sendMessage(chatId, '❌ Invalid ID or price. Usage: `/updatealert 3 3600`', { parse_mode: 'Markdown' });
+    return bot.sendMessage(
+      chatId,
+      '❌ Invalid ID or price. Usage: `/updatealert 3 3600`',
+      { parse_mode: 'Markdown' }
+    );
   }
 
-  // Update in Redis
   try {
     const data = await redisClient.hGetAll(`alert:${id}`);
+
     if (!data || data.chat_id !== chatId.toString()) {
-      return bot.sendMessage(chatId, `❌ Alert #${id} not found or could not be updated.`);
+      return bot.sendMessage(
+        chatId,
+        `❌ Alert #${id} not found or could not be updated.`
+      );
     }
+
     await redisClient.hSet(`alert:${id}`, 'target', newTarget.toString());
-    bot.sendMessage(chatId, `✅ Alert #${id} updated to new target: ₹${newTarget}`);
+
+    bot.sendMessage(
+      chatId,
+      `✅ Alert #${id} updated to new target: ₹${newTarget}`
+    );
   } catch (err) {
-    bot.sendMessage(chatId, `❌ Alert #${id} not found or could not be updated.`);
+    console.error('/updatealert error:', err);
+
+    bot.sendMessage(
+      chatId,
+      `❌ Alert #${id} not found or could not be updated.`
+    );
   }
 });
 
@@ -441,11 +617,14 @@ cron.schedule('*/2 * * * *', async () => {
 
   try {
     const activeIds = await redisClient.sMembers('active_alerts');
+
     if (!activeIds.length) return;
 
     const alerts = [];
+
     for (const id of activeIds) {
       const data = await redisClient.hGetAll(`alert:${id}`);
+
       if (data && data.id) {
         data.target = parseFloat(data.target);
         data.chat_id = parseInt(data.chat_id);
@@ -453,14 +632,15 @@ cron.schedule('*/2 * * * *', async () => {
       }
     }
 
-    // Group by ticker to minimise API calls
-    const byTicker = alerts.reduce((acc, a) => {
-      (acc[a.ticker] = acc[a.ticker] || []).push(a);
+    // Group alerts by ticker to minimise API calls.
+    const byTicker = alerts.reduce((acc, alert) => {
+      (acc[alert.ticker] = acc[alert.ticker] || []).push(alert);
       return acc;
     }, {});
 
     for (const [ticker, group] of Object.entries(byTicker)) {
       let currentPrice;
+
       try {
         const data = await fetchAnalysis(ticker);
         currentPrice = data.price;
@@ -473,18 +653,32 @@ cron.schedule('*/2 * * * *', async () => {
         const hit =
           (alert.direction === 'above' && currentPrice >= alert.target) ||
           (alert.direction === 'below' && currentPrice <= alert.target) ||
-          (alert.direction === 'any');    // first check sets direction
+          (alert.direction === 'any');
 
         if (alert.direction === 'any') {
-          // Lock in direction based on current vs target
-          const dir = currentPrice >= alert.target ? 'above' : 'below';
-          await redisClient.hSet(`alert:${alert.id}`, 'direction', dir);
-          continue; // evaluate on next tick
+          const direction = currentPrice >= alert.target ? 'above' : 'below';
+
+          await redisClient.hSet(
+            `alert:${alert.id}`,
+            'direction',
+            direction
+          );
+
+          continue;
         }
 
         if (hit) {
-          await redisClient.hSet(`alert:${alert.id}`, 'triggered', '1');
-          await redisClient.sRem('active_alerts', alert.id.toString());
+          await redisClient.hSet(
+            `alert:${alert.id}`,
+            'triggered',
+            '1'
+          );
+
+          await redisClient.sRem(
+            'active_alerts',
+            alert.id.toString()
+          );
+
           bot.sendMessage(
             alert.chat_id,
             `🚨 *Price Alert Triggered!*\n\n` +
@@ -500,173 +694,293 @@ cron.schedule('*/2 * * * *', async () => {
   }
 });
 
-// ── Portfolio Commands ────────────────────────────────────────────────────────
+// ── Portfolio Commands (Redis Hashes + Sets) ──────────────────────────────────
+// Hash: portfolio:{chat_id}:{ticker}
+// Set:  user_portfolio:{chat_id}
 
 // /buy <ticker> <quantity> <price>
 bot.onText(/^\/buy(?:@\S+)?(?:\s+(.*))?$/i, async (msg, match) => {
   const chatId = msg.chat.id;
   const args = match[1]?.trim().split(/\s+/);
 
-  if (!args || args.length < 3) {
-    return bot.sendMessage(chatId, '❓ Usage: `/buy TCS 10 3500` (ticker, quantity, price)', { parse_mode: 'Markdown' });
+  if (!args || args.length !== 3) {
+    return bot.sendMessage(
+      chatId,
+      '❓ Usage: /buy TCS 10 3500'
+    );
   }
 
-  const ticker   = args[0].toUpperCase();
-  const quantity = parseFloat(args[1]);
-  const buyPrice = parseFloat(args[2]);
+  const ticker = args[0].toUpperCase();
+  const quantity = Number(args[1]);
+  const buyPrice = Number(args[2]);
 
-  if (isNaN(quantity) || quantity <= 0 || isNaN(buyPrice) || buyPrice <= 0) {
-    return bot.sendMessage(chatId, '❌ Invalid quantity or price. Usage: `/buy TCS 10 3500`', { parse_mode: 'Markdown' });
+  if (!/^[A-Z0-9.-]+$/.test(ticker) ||
+      !Number.isFinite(quantity) || quantity <= 0 ||
+      !Number.isFinite(buyPrice) || buyPrice <= 0) {
+    return bot.sendMessage(
+      chatId,
+      '❌ Invalid ticker, quantity, or price. Usage: /buy TCS 10 3500'
+    );
   }
 
-  const waiting = await bot.sendMessage(chatId, `⏳ Verifying *${ticker}*…`, { parse_mode: 'Markdown' });
+  const holdingKey = `portfolio:${chatId}:${ticker}`;
+  const userPortfolioKey = `user_portfolio:${chatId}`;
 
-  // Validate ticker before saving to portfolio
   try {
+    // Validate ticker using the analysis service and cache.
     await fetchAnalysis(ticker);
-  } catch (err) {
-    const detail = err.response?.data?.detail ?? 'Stock not found.';
-    return bot.editMessageText(`❌ *${ticker}*: ${detail}`, {
-      chat_id: chatId,
-      message_id: waiting.message_id,
-      parse_mode: 'Markdown',
+
+    const existing = await redisClient.hGetAll(holdingKey);
+
+    let totalQuantity = quantity;
+    let averageBuyPrice = buyPrice;
+
+    if (existing.quantity !== undefined && existing.quantity !== '') {
+      const oldQuantity = Number(existing.quantity);
+      const oldBuyPrice = Number(existing.buy_price);
+
+      if (!Number.isFinite(oldQuantity) || oldQuantity <= 0 ||
+          !Number.isFinite(oldBuyPrice) || oldBuyPrice <= 0) {
+        throw new Error(`Existing ${ticker} holding contains invalid data.`);
+      }
+
+      totalQuantity = oldQuantity + quantity;
+
+      averageBuyPrice =
+        ((oldQuantity * oldBuyPrice) + (quantity * buyPrice)) /
+        totalQuantity;
+    }
+
+    // Store holding details in a Redis Hash.
+    await redisClient.hSet(holdingKey, {
+      ticker,
+      quantity: String(totalQuantity),
+      buy_price: String(averageBuyPrice)
     });
-  }
 
-  // If ticker already exists for this user, add to the holding (average down/up)
-  db.get(
-    `SELECT * FROM portfolio WHERE chat_id = ? AND ticker = ?`,
-    [chatId, ticker],
-    (err, row) => {
-      if (row) {
-        const newQty   = row.quantity + quantity;
-        const avgPrice = ((row.quantity * row.buy_price) + (quantity * buyPrice)) / newQty;
-        db.run(
-          `UPDATE portfolio SET quantity = ?, buy_price = ? WHERE id = ?`,
-          [newQty, avgPrice, row.id],
-          (err) => {
-            if (err) return bot.editMessageText('❌ Failed to update holding.', { chat_id: chatId, message_id: waiting.message_id });
-            bot.editMessageText(
-              `✅ *${ticker}* holding updated!\n` +
-              `📦 Total qty: ${newQty}\n` +
-              `💰 Avg buy price: ₹${avgPrice.toFixed(2)}`,
-              { chat_id: chatId, message_id: waiting.message_id, parse_mode: 'Markdown' }
-            );
-          }
-        );
-      } else {
-        db.run(
-          `INSERT INTO portfolio (chat_id, ticker, quantity, buy_price) VALUES (?, ?, ?, ?)`,
-          [chatId, ticker, quantity, buyPrice],
-          (err) => {
-            if (err) return bot.editMessageText('❌ Failed to save holding.', { chat_id: chatId, message_id: waiting.message_id });
-            bot.editMessageText(
-              `✅ Added to portfolio!\n` +
-              `📌 *${ticker}*  ×${quantity}  @ ₹${buyPrice}`,
-              { chat_id: chatId, message_id: waiting.message_id, parse_mode: 'Markdown' }
-            );
-          }
-        );
-      }
-    }
-  );
+    // Add ticker to the user's Redis Set.
+    await redisClient.sAdd(userPortfolioKey, ticker);
+
+    return bot.sendMessage(
+      chatId,
+      `✅ *${ticker}* added to your portfolio.\n` +
+      `📦 Total quantity: ${totalQuantity}\n` +
+      `💰 Average buy price: ₹${averageBuyPrice.toFixed(2)}\n` +
+      `💵 Total invested: ₹${(totalQuantity * averageBuyPrice).toFixed(2)}`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (error) {
+    console.error('/buy Redis error:', error);
+
+    return bot.sendMessage(
+      chatId,
+      `❌ Could not add ${ticker} to your portfolio. Please check the ticker and try again.`
+    );
+  }
 });
 
-
-// /sell <ticker> [quantity]  — omit quantity to sell entire holding
-bot.onText(/\/sell\s+(\S+)(?:\s+([\d.]+))?/i, (msg, match) => {
-  const chatId  = msg.chat.id;
-  const ticker  = match[1].toUpperCase();
-  const sellQty = match[2] ? parseFloat(match[2]) : null;
-
-  if (sellQty !== null && (isNaN(sellQty) || sellQty <= 0)) {
-    return bot.sendMessage(chatId, '❌ Invalid quantity. Usage: /sell TCS 5  or  /sell TCS');
-  }
-
-  db.get(
-    `SELECT * FROM portfolio WHERE chat_id = ? AND ticker = ?`,
-    [chatId, ticker],
-    (err, row) => {
-      if (err || !row) {
-        return bot.sendMessage(chatId, `❌ *${ticker}* not found in your portfolio.`, { parse_mode: 'Markdown' });
-      }
-
-      // Sell all if no quantity specified
-      const qty = sellQty ?? row.quantity;
-
-      if (qty > row.quantity) {
-        return bot.sendMessage(
-          chatId,
-          `❌ You only have *${row.quantity}* shares of *${ticker}*.`,
-          { parse_mode: 'Markdown' }
-        );
-      }
-
-      if (qty === row.quantity) {
-        // Remove the holding entirely
-        db.run(`DELETE FROM portfolio WHERE id = ?`, [row.id], (err) => {
-          if (err) return bot.sendMessage(chatId, '❌ Failed to update portfolio.');
-          bot.sendMessage(chatId, `🗑️ Sold all *${qty}* shares of *${ticker}*.`, { parse_mode: 'Markdown' });
-        });
-      } else {
-        // Reduce quantity — buy_price (avg) stays the same
-        const remaining = row.quantity - qty;
-        db.run(`UPDATE portfolio SET quantity = ? WHERE id = ?`, [remaining, row.id], (err) => {
-          if (err) return bot.sendMessage(chatId, '❌ Failed to update portfolio.');
-          bot.sendMessage(
-            chatId,
-            `✅ Sold *${qty}* shares of *${ticker}*.\n📦 Remaining: *${remaining}* shares @ ₹${row.buy_price.toFixed(2)}`,
-            { parse_mode: 'Markdown' }
-          );
-        });
-      }
-    }
-  );
-});
-
-// /portfolio
-bot.onText(/\/portfolio$/, (msg) => {
+// /sell <ticker> [quantity]
+bot.onText(/^\/sell(?:@\S+)?(?:\s+(.*))?$/i, async (msg, match) => {
   const chatId = msg.chat.id;
+  const args = match[1]?.trim().split(/\s+/);
 
-  db.all(
-    `SELECT * FROM portfolio WHERE chat_id = ? ORDER BY ticker`,
-    [chatId],
-    (err, rows) => {
-      if (err || !rows.length) {
-        return bot.sendMessage(chatId, 'ℹ️ Your portfolio is empty. Use /buy to add stocks.');
-      }
+  if (!args || args.length < 1 || args.length > 2 || !args[0]) {
+    return bot.sendMessage(
+      chatId,
+      '❓ Usage: /sell TCS 5 or /sell TCS'
+    );
+  }
 
-      const lines = rows.map((r) => {
-        const invested = (r.quantity * r.buy_price).toFixed(2);
-        return `• *${r.ticker}*  ×${r.quantity}  @ ₹${r.buy_price.toFixed(2)}  (₹${invested} invested)`;
-      });
+  const ticker = args[0].toUpperCase();
+  const sellQuantity = args.length === 2 ? Number(args[1]) : null;
 
-      const totalInvested = rows.reduce((sum, r) => sum + r.quantity * r.buy_price, 0);
+  if (!/^[A-Z0-9.-]+$/.test(ticker) ||
+      (sellQuantity !== null &&
+       (!Number.isFinite(sellQuantity) || sellQuantity <= 0))) {
+    return bot.sendMessage(
+      chatId,
+      '❌ Invalid ticker or quantity. Usage: /sell TCS 5'
+    );
+  }
 
-      bot.sendMessage(
+  const holdingKey = `portfolio:${chatId}:${ticker}`;
+  const userPortfolioKey = `user_portfolio:${chatId}`;
+
+  try {
+    const holding = await redisClient.hGetAll(holdingKey);
+
+    if (!holding.quantity) {
+      return bot.sendMessage(
         chatId,
-        `💼 *Your Portfolio*\n━━━━━━━━━━━━━━━━━━\n${lines.join('\n')}\n━━━━━━━━━━━━━━━━━━\n💰 Total invested: ₹${totalInvested.toFixed(2)}`,
+        `❌ *${ticker}* was not found in your portfolio.`,
         { parse_mode: 'Markdown' }
       );
     }
-  );
+
+    const currentQuantity = Number(holding.quantity);
+    const buyPrice = Number(holding.buy_price);
+
+    if (!Number.isFinite(currentQuantity) || currentQuantity <= 0 ||
+        !Number.isFinite(buyPrice) || buyPrice <= 0) {
+      throw new Error(`Stored ${ticker} holding contains invalid data.`);
+    }
+
+    const quantityToSell =
+      sellQuantity === null ? currentQuantity : sellQuantity;
+
+    if (quantityToSell > currentQuantity) {
+      return bot.sendMessage(
+        chatId,
+        `❌ You only have *${currentQuantity}* shares of *${ticker}*.`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+
+    const remainingQuantity = currentQuantity - quantityToSell;
+
+    if (remainingQuantity <= 0) {
+      // Full sale: delete Hash and remove ticker from user's Set.
+      await redisClient.del(holdingKey);
+      await redisClient.sRem(userPortfolioKey, ticker);
+
+      return bot.sendMessage(
+        chatId,
+        `🗑️ Sold all ${quantityToSell} shares of ${ticker}. The holding was removed.`
+      );
+    }
+
+    // Partial sale: update quantity; average buy price remains unchanged.
+    await redisClient.hSet(
+      holdingKey,
+      'quantity',
+      String(remainingQuantity)
+    );
+
+    return bot.sendMessage(
+      chatId,
+      `✅ Sold ${quantityToSell} shares of ${ticker}.\n` +
+      `📦 Remaining quantity: ${remainingQuantity}\n` +
+      `💰 Average buy price: ₹${buyPrice.toFixed(2)}\n` +
+      `💵 Remaining invested: ₹${(remainingQuantity * buyPrice).toFixed(2)}`
+    );
+  } catch (error) {
+    console.error('/sell Redis error:', error);
+
+    return bot.sendMessage(
+      chatId,
+      '❌ Could not update your portfolio. Please try again.'
+    );
+  }
+});
+
+// /portfolio
+bot.onText(/^\/portfolio(?:@\S+)?$/i, async (msg) => {
+  const chatId = msg.chat.id;
+  const userPortfolioKey = `user_portfolio:${chatId}`;
+
+  try {
+    // Get all ticker symbols from the user's Redis Set.
+    const tickers = await redisClient.sMembers(userPortfolioKey);
+
+    if (tickers.length === 0) {
+      return bot.sendMessage(
+        chatId,
+        'ℹ️ Your portfolio is empty. Use /buy to add stocks.'
+      );
+    }
+
+    const holdings = [];
+
+    // Fetch each ticker's Redis Hash.
+    for (const ticker of tickers.sort()) {
+      const holdingKey = `portfolio:${chatId}:${ticker}`;
+      const holding = await redisClient.hGetAll(holdingKey);
+
+      // Remove stale Set members if the Hash is missing.
+      if (!holding.quantity) {
+        await redisClient.sRem(userPortfolioKey, ticker);
+        continue;
+      }
+
+      const quantity = Number(holding.quantity);
+      const buyPrice = Number(holding.buy_price);
+
+      if (!Number.isFinite(quantity) || quantity <= 0 ||
+          !Number.isFinite(buyPrice) || buyPrice <= 0) {
+        console.warn(
+          `[portfolio] Skipping invalid Redis holding for ${ticker}, chat ${chatId}`
+        );
+        continue;
+      }
+
+      holdings.push({
+        ticker,
+        quantity,
+        buyPrice,
+        invested: quantity * buyPrice
+      });
+    }
+
+    if (holdings.length === 0) {
+      return bot.sendMessage(
+        chatId,
+        'ℹ️ Your portfolio is empty. Use /buy to add stocks.'
+      );
+    }
+
+    const lines = holdings.map(
+      ({ ticker, quantity, buyPrice, invested }) =>
+        `• *${ticker}* ×${quantity} @ ₹${buyPrice.toFixed(2)} (₹${invested.toFixed(2)} invested)`
+    );
+
+    const totalInvested = holdings.reduce(
+      (total, holding) => total + holding.invested,
+      0
+    );
+
+    return bot.sendMessage(
+      chatId,
+      `💼 *Your Portfolio*\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `${lines.join('\n')}\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `💰 Total invested: ₹${totalInvested.toFixed(2)}`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (error) {
+    console.error('/portfolio Redis error:', error);
+
+    return bot.sendMessage(
+      chatId,
+      '❌ Could not retrieve your portfolio. Please try again.'
+    );
+  }
 });
 
 // ── Fallback for unknown commands ─────────────────────────────────────────────
-// Known command prefixes — update this if you add new commands
+
 const KNOWN_COMMANDS = [
   '/start', '/help',
   '/analyze', '/ipo',
-  '/sellalert', '/buyalert', '/alerts', '/cancelalert', '/updatealert',
+  '/sellalert', '/buyalert', '/alerts',
+  '/cancelalert', '/updatealert',
   '/buy', '/sell', '/portfolio',
   '/status', '/info',
 ];
 
 bot.on('message', (msg) => {
   if (!msg.text || !msg.text.startsWith('/')) return;
-  const cmd = msg.text.split(' ')[0].split('@')[0].toLowerCase(); // handle /cmd@botname
+
+  const cmd = msg.text
+    .split(' ')[0]
+    .split('@')[0]
+    .toLowerCase();
+
   if (!KNOWN_COMMANDS.includes(cmd)) {
-    bot.sendMessage(msg.chat.id, `❓ Unknown command. Type /help to see what I can do.`);
+    bot.sendMessage(
+      msg.chat.id,
+      '❓ Unknown command. Type /help to see what I can do.'
+    );
   }
 });
 
